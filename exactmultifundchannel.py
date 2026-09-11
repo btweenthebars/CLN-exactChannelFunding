@@ -7,8 +7,12 @@ Opens multiple Core Lightning channels simultaneously with zero change left back
 to the user wallet. Any leftover change is absorbed into a designated destination
 channel specified by `change_to` (index in destinations array).
 
-Arguments match multifundchannel + change_to (mandatory). Any extra/future arguments
-are passed straight through to multifundchannel without hardcoding.
+If the change cannot be added to `destinations[change_to]` due to:
+- Case 1: Non-Wumbo channel capacity limit (16,777,215 sats / 0.16777215 BTC)
+- Case 2: Peer-configured maximum channel limits or user 'max_amount'
+- Case 3: Output below dust threshold (546 sats)
+The command aborts with a descriptive error message explaining the exact cause
+so the user can decide what to do, ensuring no funds are lost or leaked to miner fees.
 """
 
 import os
@@ -18,7 +22,8 @@ import socket
 
 RPC_PATH = None
 DUST_LIMIT_SAT = 546
-P2WSH_OUTPUT_WEIGHT = 172  # (8 + 1 + 34) * 4 WU
+MAX_NON_WUMBO_SAT = 16777215  # 2^24 - 1 satoshis (0.16777215 BTC)
+P2WSH_OUTPUT_WEIGHT = 172      # (8 + 1 + 34) * 4 WU
 
 
 def rpc_call(method, params=None):
@@ -108,10 +113,60 @@ def get_utxo_spend_weight(address_or_type):
     return 271
 
 
-def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_to_idx):
+def check_wumbo_support(features_hex):
+    """
+    Checks if a peer's feature bitfield advertises option_support_large_channel (wumbo).
+    BOLT #9: Bit 18 is compulsory, Bit 19 is optional option_support_large_channel.
+    """
+    if not features_hex or not isinstance(features_hex, str):
+        return False
+    try:
+        raw_bytes = bytes.fromhex(features_hex.strip())
+    except ValueError:
+        return False
+
+    def is_bit_set(b, bit):
+        byte_offset = bit // 8
+        if byte_offset >= len(b):
+            return False
+        # Big-endian bitfield
+        return bool(b[len(b) - 1 - byte_offset] & (1 << (bit % 8)))
+
+    return is_bit_set(raw_bytes, 18) or is_bit_set(raw_bytes, 19)
+
+
+def get_peer_features(node_id_with_host):
+    """
+    Queries peer features via listpeers or listnodes to check capability flags.
+    """
+    node_id = node_id_with_host.split("@")[0].strip()
+    try:
+        peers_res = rpc_call("listpeers", {"id": node_id})
+        peers = peers_res.get("peers", [])
+        if peers and "features" in peers[0]:
+            return peers[0]["features"]
+    except Exception:
+        pass
+
+    try:
+        nodes_res = rpc_call("listnodes", {"id": node_id})
+        nodes = nodes_res.get("nodes", [])
+        if nodes and "features" in nodes[0]:
+            return nodes[0]["features"]
+    except Exception:
+        pass
+
+    return None
+
+
+def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_to_idx, peer_features_hex=None):
     """
     Calculates exact zero-change funding allocation down to the single satoshi.
     Absorbs all remaining input funds into destinations[change_to_idx].
+    Validates against:
+    - Dust limit (< 546 sats)
+    - Wumbo capacity limit (16,777,215 sats) if peer does not support large channels
+    - User-specified max_amount limit if configured
     """
     num_inputs = len(utxos_info)
     num_outputs = len(destinations)
@@ -124,6 +179,9 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
         raise ValueError(
             f"'change_to' index {change_to_idx} is out of bounds for destinations list of length {num_outputs}."
         )
+
+    target_dest = destinations[change_to_idx]
+    target_node_id = target_dest.get("id", f"index_{change_to_idx}")
 
     # 1. Total transaction weight without change output
     core_weight = bitcoin_tx_core_weight(num_inputs, num_outputs)
@@ -146,21 +204,48 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
     )
 
     # 5. Exact amount for destinations[change_to_idx]
-    target_orig_amount = parse_sat_amount(destinations[change_to_idx]["amount"])
+    target_orig_amount = parse_sat_amount(target_dest["amount"])
     exact_target_amount = total_inputs - other_dest_sum - exact_fee
 
+    # Validation Case 3: Dust check
     if exact_target_amount < DUST_LIMIT_SAT:
         raise ValueError(
-            f"Resulting channel amount for destination {change_to_idx} ({destinations[change_to_idx].get('id', '')}) "
-            f"is {exact_target_amount} sats, which is below the dust limit ({DUST_LIMIT_SAT} sats). "
-            f"Provide more input funds or reduce channel amounts."
+            f"Cannot add change to destination {change_to_idx} ('{target_node_id}'): "
+            f"resulting channel amount ({exact_target_amount} sats) is below the Bitcoin dust threshold ({DUST_LIMIT_SAT} sats). "
+            f"Total inputs ({total_inputs:,} sats) are insufficient to cover other channels ({other_dest_sum:,} sats) and fee ({exact_fee:,} sats). "
+            f"Please supply more input funds or reduce channel amounts."
         )
+
+    # Validation Case 2 (User Cap): Optional user-configured max_amount
+    if "max_amount" in target_dest and target_dest["max_amount"] is not None:
+        user_max = parse_sat_amount(target_dest["max_amount"])
+        if exact_target_amount > user_max:
+            excess_above_max = exact_target_amount - user_max
+            raise ValueError(
+                f"Cannot add change to destination {change_to_idx} ('{target_node_id}'): "
+                f"resulting channel amount ({exact_target_amount:,} sats) exceeds the configured 'max_amount' of {user_max:,} sats "
+                f"by {excess_above_max:,} sats. Aborting so you can select an alternative destination for change_to, "
+                f"adjust inputs, or increase max_amount."
+            )
+
+    # Validation Case 1: Wumbo check (large channels)
+    if exact_target_amount > MAX_NON_WUMBO_SAT:
+        is_wumbo = check_wumbo_support(peer_features_hex)
+        if not is_wumbo:
+            excess_above_wumbo = exact_target_amount - MAX_NON_WUMBO_SAT
+            raise ValueError(
+                f"Cannot add change to destination {change_to_idx} ('{target_node_id}'): "
+                f"resulting channel amount ({exact_target_amount:,} sats) exceeds the non-Wumbo limit of {MAX_NON_WUMBO_SAT:,} sats "
+                f"(0.16777215 BTC) by {excess_above_wumbo:,} sats, and peer '{target_node_id}' does not support "
+                f"'option_support_large_channel' (BOLT #9 wumbo feature bit 19). "
+                f"Aborting so you can select a wumbo-enabled destination for change_to or provide fewer input funds."
+            )
 
     change_absorbed = exact_target_amount - target_orig_amount
 
-    # Sanity check: total inputs == total outputs + fee (strictly 0 change)
+    # Invariant verification: strictly 0 satoshis unallocated to outputs or fee
     total_outputs = other_dest_sum + exact_target_amount
-    assert total_inputs - total_outputs == exact_fee, "Accounting invariant failed: Inputs - Outputs != Fee!"
+    assert total_inputs - total_outputs == exact_fee, "Accounting error: Inputs - Outputs != Fee!"
 
     return {
         "exact_target_amount": exact_target_amount,
@@ -171,14 +256,13 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
         "total_inputs": total_inputs,
         "other_dest_sum": other_dest_sum,
         "change_to_idx": change_to_idx,
-        "change_to_id": destinations[change_to_idx].get("id", "")
+        "change_to_id": target_node_id
     }
 
 
 def get_mfc_parameter_names():
     """
-    Dynamically fetches the positional parameter names of multifundchannel
-    from CLN help command so that we don't hardcode them.
+    Dynamically fetches positional parameter names of multifundchannel from CLN help.
     """
     default_args = ["destinations", "feerate", "minconf", "utxos", "minchannels", "commitment_feerate"]
     try:
@@ -217,8 +301,7 @@ def normalize_params(params):
 
 def parse_destinations(destinations_raw):
     """
-    Parses destinations array, handling lists of dicts or lists of JSON strings
-    (such as destinations=['{"id": "...", "amount": ...}', ...]).
+    Parses destinations array, handling lists of dicts or lists of JSON strings.
     """
     if isinstance(destinations_raw, str):
         destinations_raw = json.loads(destinations_raw)
@@ -240,7 +323,7 @@ def parse_destinations(destinations_raw):
 def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf=1):
     """
     Collects confirmed UTXOs from wallet matching specified_utxos, or performs
-    automatic coin selection via fundpsbt(reserve=0) for the base channel amounts.
+    automatic coin selection via fundpsbt(reserve=0) for base channel amounts.
     """
     funds = rpc_call("listfunds")["outputs"]
     wallet_utxos = {f"{u['txid']}:{u['output']}": u for u in funds if u.get("status") == "confirmed"}
@@ -294,10 +377,11 @@ def process_exact_funding(raw_params, dry_run=False):
     """
     Processes exact zero-change funding:
     1. Normalizes parameters dynamically.
-    2. Parses destinations and change_to index (mandatory).
+    2. Validates mandatory change_to index.
     3. Resolves feerate and UTXOs.
-    4. Calculates exact non-change satoshi amount for destinations[change_to].
-    5. Updates destinations and calls multifundchannel with ALL other arguments preserved.
+    4. Validates wumbo and peer limits.
+    5. Calculates exact non-change satoshi amount for destinations[change_to].
+    6. Updates destinations and calls multifundchannel with ALL other arguments preserved.
     """
     params = normalize_params(raw_params)
 
@@ -324,6 +408,8 @@ def process_exact_funding(raw_params, dry_run=False):
             f"(valid indices: 0 to {len(destinations) - 1})."
         )
 
+    target_peer_id = destinations[change_to_idx].get("id", "")
+
     # 2. Resolve feerate to perkw via CLN
     feerate_arg = params.get("feerate", "opening")
     feerate_res = rpc_call("parsefeerate", {"feerate": feerate_arg})
@@ -334,13 +420,23 @@ def process_exact_funding(raw_params, dry_run=False):
     specified_utxos = params.get("utxos")
     selected_utxos = collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf)
 
-    # 4. Calculate exact zero-change allocation
-    calc = calculate_exact_allocation(destinations, feerate_per_kw, selected_utxos, change_to_idx)
+    # 4. Check peer features (Wumbo support) if RPC available
+    peer_features = get_peer_features(target_peer_id)
 
-    # 5. Update destinations: add the change into destinations[change_to_idx]
+    # 5. Calculate exact zero-change allocation and validate limits
+    calc = calculate_exact_allocation(
+        destinations,
+        feerate_per_kw,
+        selected_utxos,
+        change_to_idx,
+        peer_features_hex=peer_features
+    )
+
+    # 6. Update destinations: add the change into destinations[change_to_idx]
     final_destinations = []
     for idx, d in enumerate(destinations):
         new_d = dict(d)
+        new_d.pop("max_amount", None)  # internal plugin parameter
         if idx == change_to_idx:
             new_d["amount"] = calc["exact_target_amount"]
         else:
@@ -364,7 +460,7 @@ def process_exact_funding(raw_params, dry_run=False):
         "utxos_spent": utxo_outpoints
     }
 
-    # 6. Prepare multifundchannel arguments:
+    # 7. Prepare multifundchannel arguments:
     # Retain ALL original arguments without hardcoding, remove change_to, update destinations & utxos
     mfc_params = dict(params)
     mfc_params.pop("change_to", None)
@@ -379,10 +475,22 @@ def process_exact_funding(raw_params, dry_run=False):
             "multifundchannel_params": mfc_params
         }
 
-    # 7. Execute multifundchannel
-    mfc_res = rpc_call("multifundchannel", mfc_params)
-    mfc_res["zero_change_summary"] = summary
-    return mfc_res
+    # 8. Execute multifundchannel with explicit error trapping for peer limit rejections
+    try:
+        mfc_res = rpc_call("multifundchannel", mfc_params)
+        mfc_res["zero_change_summary"] = summary
+        return mfc_res
+    except RuntimeError as e:
+        err_msg = str(e)
+        # Catch peer rejections and provide a clear actionable error
+        if "max" in err_msg.lower() or "large" in err_msg.lower() or "capacity" in err_msg.lower() or "reject" in err_msg.lower():
+            raise RuntimeError(
+                f"Peer '{target_peer_id}' at destination {change_to_idx} rejected the funding amount of "
+                f"{calc['exact_target_amount']:,} satoshis ({err_msg}). "
+                f"Aborting to prevent excess funds from going to miner fees. "
+                f"Please choose a different destination for 'change_to' or reduce funding inputs."
+            )
+        raise
 
 
 def main():
