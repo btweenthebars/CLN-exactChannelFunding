@@ -45,7 +45,7 @@ When opening multiple channels with CLN's standard `multifundchannel`:
 - **Exact Allocation**: Calculates the exact transaction fee for a transaction with **zero change outputs**, allocating 100% of the remaining input satoshis into `destinations[change_to]`.
 - **Double Savings**: You eliminate the change output bytes, and the fee savings from omitting that output are redirected straight into channel capacity rather than paid to miners.
 
-$$\sum \text{Inputs} - \sum \text{Outputs} = \text{Fee}_{\text{exact}}$$
+$$\sum \text{Inputs} - \sum \text{Outputs} = \text{Fee}$$
 $$\text{Change Output Count} = 0$$
 $$\text{Change Amount} = 0 \text{ satoshis}$$
 
@@ -53,60 +53,61 @@ $$\text{Change Amount} = 0 \text{ satoshis}$$
 
 ## The Exact Calculation (Mathematical Breakdown)
 
-To eliminate the change output, the transaction is structured with $M$ inputs, $N$ channel outputs, and **$0$ change outputs**.
+To eliminate the change output, the transaction is structured with $M$ inputs, $N$ channel outputs, and **0 change outputs**.
 
 ### 1. Sum Total Inputs ($I$)
-$$I = \sum_{j=1}^{M} \text{UTXO\_amount}_j \quad (\text{in satoshis})$$
+$$I = \sum_{j=1}^{M} \text{Input}_j \quad (\text{in satoshis})$$
 
-### 2. Transaction Weight ($W_{\text{no\_change}}$)
-In Bitcoin SegWit, weight is measured in Weight Units (WU), where $4 \text{ WU} = 1 \text{ vbyte}$:
-$$W_{\text{no\_change}} = W_{\text{core}} + W_{\text{inputs}} + W_{\text{outputs}}$$
+### 2. Transaction Weight ($W$)
+In Bitcoin SegWit, weight is measured in Weight Units (WU), where $4\text{ WU} = 1\text{ vbyte}$:
+$$W = W_{\text{core}} + W_{\text{inputs}} + W_{\text{outputs}}$$
 
 - **Core Weight ($W_{\text{core}}$)**: [`lightning/bitcoin/tx.c:L849`](lightning/bitcoin/tx.c)
-  $$\text{Version (4B)} + \text{Locktime (4B)} + \text{Input Varint (1B)} + \text{Output Varint (1B)} = 10\text{B} \times 4 = 40 \text{ WU}$$
-  $$\text{SegWit Marker (1B)} + \text{Flag (1B)} = 2 \text{ WU}$$
-  $$W_{\text{core}} = 40 + 2 = \mathbf{42 \text{ WU}}$$
+  $$\text{Version (4B)} + \text{Locktime (4B)} + \text{Input Count (1B)} + \text{Output Count (1B)} = 10\text{B} \times 4 = 40\text{ WU}$$
+  $$\text{SegWit Marker (1B)} + \text{Flag (1B)} = 2\text{ WU}$$
+  $$W_{\text{core}} = 40 + 2 = \mathbf{42\text{ WU}}$$
 
 - **Channel Outputs Weight ($W_{\text{outputs}}$)**: [`lightning/bitcoin/tx.c:L872`](lightning/bitcoin/tx.c)
   Each Lightning funding output (P2WSH or P2TR) has a 34-byte `scriptPubKey`:
-  $$\text{Amount (8B)} + \text{Len Varint (1B)} + \text{Script (34B)} = 43\text{B} \times 4 = \mathbf{172 \text{ WU}} \quad (43 \text{ vbytes})$$
-  $$W_{\text{outputs}} = N \times 172 \text{ WU}$$
+  $$\text{Amount (8B)} + \text{Len Varint (1B)} + \text{Script (34B)} = 43\text{B} \times 4 = \mathbf{172\text{ WU}} \quad (43\text{ vbytes})$$
+  $$W_{\text{outputs}} = N \times 172\text{ WU}$$
 
 - **Input Spend Weights ($W_{\text{inputs}}$)**: [`lightning/common/utxo.c:L4`](lightning/common/utxo.c)
-  Each input outpoint (36B) + script len (1B) + sequence (4B) $= 41\text{B} \times 4 = 164 \text{ WU}$, plus witness data:
-  - **P2TR (Taproot `bc1p...`):** $164 + 66 \text{ (witness)} = \mathbf{230 \text{ WU}} \quad (57.5 \text{ vbytes})$
-  - **P2WPKH (Native SegWit `bc1q...`):** $164 + 107 \text{ (witness)} = \mathbf{271 \text{ WU}} \quad (67.75 \text{ vbytes})$
-  - **P2SH-P2WPKH (Nested SegWit `3...`):** $164 + 92 \text{ (scriptSig)} + 107 \text{ (witness)} = \mathbf{363 \text{ WU}} \quad (90.75 \text{ vbytes})$
+  Each input outpoint (36B) + script len (1B) + sequence (4B) $= 41\text{B} \times 4 = 164\text{ WU}$, plus witness data:
+  - **P2TR (Taproot `bc1p...`):** $164 + 66 = \mathbf{230\text{ WU}} \quad (57.5\text{ vbytes})$
+  - **P2WPKH (Native SegWit `bc1q...`):** $164 + 107 = \mathbf{271\text{ WU}} \quad (67.75\text{ vbytes})$
+  - **P2SH-P2WPKH (Nested SegWit `3...`):** $164 + 92 + 107 = \mathbf{363\text{ WU}} \quad (90.75\text{ vbytes})$
   $$W_{\text{inputs}} = \sum_{j=1}^{M} W_{\text{input}, j}$$
 
-### 3. Exact Miner Fee ($\text{Fee}_{\text{exact}}$)
+### 3. Exact Miner Fee ($\text{Fee}$)
 CLN feerates are expressed in `perkw` (satoshis per 1000 weight units). Matching CLN's integer division ([`lightning/common/amount.c:L698`](lightning/common/amount.c)):
-$$\text{Fee}_{\text{exact}} = \left\lfloor \frac{\text{feerate\_per\_kw} \times W_{\text{no\_change}}}{1000} \right\rfloor \quad (\text{satoshis})$$
+$$\text{Fee} = \left\lfloor \frac{\text{feerate} \times W}{1000} \right\rfloor \quad (\text{satoshis})$$
 
 ### 4. Sum Other Fixed Channels ($A_{\text{fixed}}$)
-$$A_{\text{fixed}} = \sum_{i \ne \text{change\_to}} \text{amount}_i$$
+$$A_{\text{fixed}} = \sum_{i \ne c} \text{amount}_i$$
+*(where $c$ is the index designated by `change_to`)*
 
 ### 5. Final Allocation for `destinations[change_to]`
-$$\text{Amount}(\text{change\_to}) = I - A_{\text{fixed}} - \text{Fee}_{\text{exact}}$$
-$$\text{Change Absorbed} = \text{Amount}(\text{change\_to}) - \text{Original\_Base\_Amount}(\text{change\_to})$$
+$$\text{Amount}(c) = I - A_{\text{fixed}} - \text{Fee}$$
+$$\text{Change Absorbed} = \text{Amount}(c) - \text{BaseAmount}(c)$$
 
 ### Concrete Example:
-- **Inputs**: Two Native SegWit UTXOs of $2,000,000 \text{ sats}$ each $\rightarrow I = 4,000,000 \text{ sats}$
+- **Inputs**: Two Native SegWit UTXOs of $2,000,000\text{ sats}$ each $\rightarrow I = 4,000,000\text{ sats}$
 - **Channels**:
-  - Index 0 (`node "aaaaa"`): $1,000,000 \text{ sats}$
-  - Index 1 (`node "bbbb"`, `change_to=1`): $2,000,000 \text{ sats}$ base
-- **Feerate**: $700 \text{ perkw}$ ($2.8 \text{ sat/vB}$)
+  - Index 0 (`node "aaaaa"`): $1,000,000\text{ sats}$
+  - Index 1 (`node "bbbb"`, `change_to=1`): $2,000,000\text{ sats}$ base
+- **Feerate**: $700\text{ perkw}$ ($2.8\text{ sat/vB}$)
 
-1. Weight: $W = 42 + (2 \times 271) + (2 \times 172) = \mathbf{928 \text{ WU}}$ ($232 \text{ vbytes}$).
-2. Fee: $\lfloor (700 \times 928) / 1000 \rfloor = \mathbf{649 \text{ sats}}$.
+1. Weight: $W = 42 + (2 \times 271) + (2 \times 172) = \mathbf{928\text{ WU}}$ ($232\text{ vbytes}$).
+2. Fee: $\lfloor (700 \times 928) / 1000 \rfloor = \mathbf{649\text{ sats}}$.
 3. Allocation to node `"bbbb"`:
-   $$\text{Amount} = 4,000,000 - 1,000,000 - 649 = \mathbf{2,999,351 \text{ sats}}$$
-4. Node `"bbbb"` receives its base $2,000,000 + 999,351 \text{ sats}$ of change.
+   $$\text{Amount} = 4,000,000 - 1,000,000 - 649 = \mathbf{2,999,351\text{ sats}}$$
+4. Node `"bbbb"` receives its base $2,000,000 + 999,351\text{ sats}$ of change.
 5. Transaction outputs:
-   - Output 0: $1,000,000 \text{ sats}$ (`aaaaa`)
-   - Output 1: $2,999,351 \text{ sats}$ (`bbbb`)
+   - Output 0: $1,000,000\text{ sats}$ (`aaaaa`)
+   - Output 1: $2,999,351\text{ sats}$ (`bbbb`)
    - Output 2: **None (0 change outputs)**
-   - Miner Fee: $649 \text{ sats}$
+   - Miner Fee: $649\text{ sats}$
 
 ---
 
