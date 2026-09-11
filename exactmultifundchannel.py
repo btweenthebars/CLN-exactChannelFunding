@@ -67,6 +67,12 @@ def parse_sat_amount(amt):
     if isinstance(amt, int):
         return amt
     s = str(amt).strip().lower()
+    if s == "all":
+        raise ValueError(
+            "Destination amount cannot be 'all'. In exactmultifundchannel, specify the base numerical "
+            "amount for each channel, and use 'change_to=<index>' to designate which channel absorbs "
+            "all leftover change."
+        )
     if s.endswith("msat"):
         return int(s[:-4]) // 1000
     elif s.endswith("sat"):

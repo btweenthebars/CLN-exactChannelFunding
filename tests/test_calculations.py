@@ -160,6 +160,11 @@ class TestExactChannelFunding(unittest.TestCase):
             process_exact_funding(params_without_change_to)
         self.assertIn("Missing required parameter 'change_to'", str(ctx.exception))
 
+    def test_amount_all_raises_clear_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            parse_sat_amount("all")
+        self.assertIn("Destination amount cannot be 'all'", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
