@@ -352,11 +352,18 @@ def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf=1):
             "feerate": f"{feerate_per_kw}perkw",
             "startweight": startweight,
             "minconf": minconf,
-            "reserve": 0,
+            "reserve": 100,
             "excess_as_change": True
         })
 
         reservations = fund_res.get("reservations", [])
+        # Immediately release the reservation so multifundchannel can spend them cleanly
+        if "psbt" in fund_res:
+            try:
+                rpc_call("unreserveinputs", {"psbt": fund_res["psbt"]})
+            except Exception:
+                pass
+
         for res in reservations:
             outpoint = f"{res['txid']}:{res['vout']}"
             u = wallet_utxos.get(outpoint, {})
