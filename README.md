@@ -10,6 +10,7 @@ All leftover change satoshis are mathematically calculated and absorbed into a d
 1. [The Problem with Default Multifunding](#the-problem-with-default-multifunding)
 2. [The Solution: Zero-Change Funding](#the-solution-zero-change-funding)
    - [Why Not Native multifundchannel with "amount": "all"?](#why-not-native-multifundchannel-with-amount-all)
+   - [Deep Dive: Does Native multifundchannel Spill Satoshis to Miners?](#deep-dive-does-native-multifundchannel-spill-satoshis-to-miners)
    - [Feature Comparison Table](#feature-comparison-table)
 3. [The Exact Calculation (Mathematical Breakdown)](#the-exact-calculation-mathematical-breakdown)
 4. [How UTXOs Are Selected & Figured Out](#how-utxos-are-selected--figured-out)
@@ -60,24 +61,51 @@ Core Lightning's native `multifundchannel` does support setting `"amount": "all"
 If you omit `utxos`, native `multifundchannel` asks CLN's wallet for `"satoshi": "all"`. In Core Lightning ([`wallet/reservation.c:L572`](lightning/wallet/reservation.c)), this instructs the coin selector to **sweep every single available confirmed UTXO in your entire wallet** into that one channel. If your node has 10 UTXOs totaling 4 BTC, it will sweep all 4 BTC into that channel!
 - **Our Plugin**: Queries CLN's coin selector for **only the base channel amounts** (e.g. 1M + 2M = 3M sats). It selects only enough coins to cover the batch, leaving the rest of your wallet untouched, and absorbs just the leftover change from those specific coins into `change_to`.
 
-#### 2. In Manual Mode (`utxos` specified): 5 Critical Advantages Over Native
-Even if you manually pass `utxos=[...]` (where native `multifundchannel` can produce 0 change), `exactmultifundchannel` provides 5 crucial benefits that native CLN lacks:
+#### 2. In Manual Mode (`utxos` specified): 6 Critical Advantages Over Native
+Even if you manually pass `utxos=[...]` (where native `multifundchannel` can produce 0 change), `exactmultifundchannel` provides 6 crucial benefits that native CLN lacks:
 
 1. **Protection Against Silent Non-Wumbo Trimming**:
    If the UTXOs you specify total $> 16,777,215\text{ sats}$ ($0.168\text{ BTC}$) and the `"all"` destination does not support Wumbo (large channels), native CLN ([`multifundchannel.c:L1291`](lightning/plugins/spender/multifundchannel.c)) **silently trims the channel to 16.77M sats, removes `"all"`, and creates a change output anyway**! Your zero-change goal is silently defeated.
    - **Our Plugin**: Checks the peer's BOLT #9 feature bits 18/19 before broadcast and **halts with a clear error**, allowing you to choose a Wumbo-enabled peer or adjust inputs.
-2. **Channel Capacity Caps (`max_amount`)**:
+2. **Protection Against Accidental Miner Fee Spills**:
+   In native CLN, when a non-Wumbo channel is trimmed, any remaining excess funds that fall below the dust limit ($< 546\text{ sats}$) cannot form a change output and are abandoned directly to miners as an unintended fee bonus. `exactmultifundchannel` halts upfront before building the transaction, guaranteeing zero satoshis leak to miners.
+3. **Channel Capacity Caps (`max_amount`)**:
    Native CLN has no way to cap an `"all"` channel. If you pass a 5M sat UTXO for a 2M sat base channel, native CLN dumps the entire $\sim 4\text{M sat}$ remainder into that channel.
    - **Our Plugin**: Supports `"max_amount"`. If change pushes the channel above your liquidity ceiling, it halts before broadcasting.
-3. **Dry-Run / Preview Mode (`calculate_exact_funding`)**:
+4. **Dry-Run / Preview Mode (`calculate_exact_funding`)**:
    Native CLN provides no way to preview the resulting transaction without broadcasting.
    - **Our Plugin**: Allows full inspection of transaction weight, exact miner fee, and satoshi allocations down to the single satoshi before signing.
-4. **Pre-flight Dust Protection**:
+5. **Pre-flight Dust Protection**:
    If inputs are slightly too low, native CLN can fail halfway through protocol handshakes.
    - **Our Plugin**: Verifies that the remaining satoshis satisfy the Bitcoin dust threshold ($546\text{ sats}$) mathematically before initiating handshakes.
-5. **Clean API Ergonomics**:
+6. **Clean API Ergonomics**:
    Native CLN forces you to mutate your destination JSON object, replacing an integer amount with the string `"all"`.
    - **Our Plugin**: Keeps all channel amounts as clean integers and uses a simple, separate `change_to=index` parameter.
+
+---
+
+### Deep Dive: Does Native `multifundchannel` Spill Satoshis to Miners?
+
+A common concern when batching channels is whether unallocated funds can accidentally spill over to miners as an excessive transaction fee.
+
+#### 1. The Sub-Dust Spill on Non-Wumbo Trimming (The Real Leak)
+- When a destination uses `"amount": "all"` but the peer is non-Wumbo, native CLN trims the channel to $16,777,215\text{ sats}$ ([`multifundchannel.c:L1291`](lightning/plugins/spender/multifundchannel.c)) and retries funding with `excess_as_change = true`.
+- In `wallet/reservation.c`, CLN evaluates whether the leftover funds ($\text{Inputs} - 16,777,215 - \text{Fee}$) can afford a change output via `change_amount()` ([`bitcoin/tx.c:L980`](lightning/bitcoin/tx.c)).
+- Under Bitcoin network consensus rules, outputs below the dust limit ($330\text{ sats}$ for SegWit/Taproot, $546\text{ sats}$ for legacy) are non-standard. If the leftover is below this threshold (or cannot pay the change output fee), `change_amount()` returns 0 and **no change output is created**.
+- Because the channel is strictly capped at $16.77\text{M sats}$ and cannot take the leftover, and no change output is made, **those remaining satoshis ($< 546\text{ sats}$) are left in the transaction and paid directly to miners**.
+- **`exactmultifundchannel` Solution**: Our plugin evaluates all limits in pre-flight checks and aborts before creating a PSBT. Satoshis never spill to miners.
+
+#### 2. Peer Negotiation Failure: What Happens to Large Amounts (e.g. 2M sats)?
+- **Do large amounts spill to miners? No.** If you intend to open Channel A ($2\text{M sats}$) and Channel B, and Channel A fails negotiation, those $2\text{M sats}$ **will never go to miners**.
+- CLN and Bitcoin mempools enforce strict maximum fee limits (`max-fee-percent`). $2\text{M sats}$ vastly exceeds the dust limit, so if a partial batch proceeds, CLN will generate a change output to return the $2\text{M sats}$ safely to your on-chain wallet.
+- **Why it still breaks user expectations:** If you opened Channel B with `"all"`, you might wonder why Channel B does not absorb the failed $2\text{M sats}$. In CLN, having Channel B balloon from $500\text{k sats}$ to $2.5\text{M sats}$ would dangerously distort your capital allocation and node liquidity. Instead, CLN freezes Channel B at its initial calculated size, turning the unspent $2\text{M sats}$ into an unwanted on-chain change output.
+
+#### 3. Atomic All-or-Nothing vs. Partial Batching (`minchannels`)
+- **Default Atomic Behavior (All-or-Nothing)**: By default, `minchannels` equals the total number of destinations (`tal_count(destinations)`). If **any** peer fails negotiation (e.g., peer offline, rejected terms), CLN **aborts the entire command immediately**. It releases all UTXO reservations and broadcasts **zero transactions**, leaving your wallet 100% untouched so you can adjust amounts and resubmit.
+- **Opt-in Partial Batching**: The retry behavior (where surviving channels open and failed amounts become change) **only triggers if you explicitly specify `minchannels`** to a lower value (e.g., `minchannels=1`).
+- In **`exactmultifundchannel`**, omitting `minchannels` (the default) guarantees atomic all-or-nothing execution: either all channels open cleanly with zero change, or the entire operation cleanly aborts without touching the chain.
+
+---
 
 ### Feature Comparison Table
 
@@ -86,6 +114,8 @@ Even if you manually pass `utxos=[...]` (where native `multifundchannel` can pro
 | **Zero Change Output** | ❌ (Creates change) | ✅ (Only with `utxos`) | ✅ **Always 0 change** |
 | **Auto Coin Selection (No `utxos`)** | ✅ | ❌ **Sweeps entire wallet** | ✅ **Targeted coin selection** |
 | **Non-Wumbo Safety** | N/A | ❌ Silently creates change output | ✅ **Aborts with clear error** |
+| **No Sub-Dust Miner Spill** | N/A | ❌ Leaks sub-dust sats on trim | ✅ **Guaranteed no leaks** |
+| **Atomic All-or-Nothing (Default)** | ✅ | ✅ | ✅ **Preserved (0 change)** |
 | **Channel Caps (`max_amount`)** | ❌ | ❌ | ✅ **Supported** |
 | **Dry-Run Preview** | ❌ | ❌ | ✅ **`calculate_exact_funding`** |
 | **Pre-flight Dust Validation** | ❌ | ❌ | ✅ **Validated before handshake** |
@@ -187,6 +217,7 @@ If all change cannot be safely added to `destinations[change_to]`, the plugin **
   ```text
   Cannot add change to destination 1 ('bbbb'): resulting channel amount (18,500,000 sats) exceeds the non-Wumbo limit of 16,777,215 sats (0.16777215 BTC) and peer does not support 'option_support_large_channel' (wumbo). Aborting so you can select a wumbo-enabled destination for change_to or provide fewer input funds.
   ```
+- **Why this prevents miner spills**: In native CLN, trimming a channel to 16.77M sats leaves sub-dust remainders ($< 546\text{ sats}$) stranded in the transaction as an unintended miner fee bonus. By halting before transaction creation, our plugin guarantees that zero satoshis leak to miners.
 
 ### Exception 2: User `max_amount` & Peer-Side Size Limits
 - **User Cap (`max_amount`)**: You can set an optional `max_amount` on any destination (e.g. `{"id": "bbbb", "amount": 2000000, "max_amount": 2500000}`). If the change pushes the channel above `max_amount`, the plugin halts:
@@ -230,7 +261,8 @@ exactmultifundchannel destinations [feerate] [minconf] [utxos] [minchannels] [co
 - `change_to` *(integer, required)*: Zero-based index in `destinations` of the channel that receives all leftover change. **Mandatory with no default**.
 - `feerate` *(string/number, optional)*: Target feerate (`"normal"`, `"urgent"`, `"slow"`, `700`, `"2500perkw"`). Defaults to `"opening"`.
 - `utxos` *(array of strings, optional)*: Specific `["txid:vout", ...]` outpoints to spend. If omitted, automatic targeted coin selection is used.
-- `minconf`, `minchannels`, `commitment_feerate`, etc.: **Any other current or future argument** supported by `multifundchannel` is passed through automatically without hardcoding.
+- `minchannels` *(integer, optional)*: Minimum number of channels that must succeed. Defaults to the total number of destinations (**atomic all-or-nothing**: if any peer fails negotiation, the entire operation cleanly aborts without broadcasting any transaction or spending fees).
+- `minconf`, `commitment_feerate`, etc.: **Any other current or future argument** supported by `multifundchannel` is passed through automatically without hardcoding.
 
 ### CLI Examples
 
