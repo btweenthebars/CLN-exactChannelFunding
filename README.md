@@ -19,6 +19,7 @@ All leftover change satoshis are mathematically calculated and absorbed into a d
    - [Exception 1: Non-Wumbo Channel Limit (16,777,215 sats)](#exception-1-non-wumbo-channel-limit-16777215-sats)
    - [Exception 2: User `max_amount` & Peer-Side Size Limits](#exception-2-user-max_amount--peer-side-size-limits)
    - [Exception 3: Dust Limit (< 546 sats)](#exception-3-dust-limit--546-sats)
+   - [Exception 4: Destination Amount Cannot Be "all"](#exception-4-destination-amount-cannot-be-all)
 6. [Command Reference & Manual](#command-reference--manual)
    - [Parameters](#parameters)
    - [CLI Examples](#cli-examples)
@@ -201,6 +202,16 @@ If all change cannot be safely added to `destinations[change_to]`, the plugin **
   Cannot add change to destination 0 ('aaaaa'): resulting channel amount (412 sats) is below the Bitcoin dust threshold (546 sats). Total inputs are insufficient to cover other channels and fees.
   ```
 
+### Exception 4: Destination Amount Cannot Be "all"
+- In `exactmultifundchannel`, every destination must specify its **numerical base funding amount**.
+- Setting `"amount": "all"` is explicitly prohibited because:
+  1. In Automatic Mode, CLN's coin selector requires numerical target amounts to determine how many coins to pick without sweeping your entire wallet.
+  2. The channel that absorbs the change is designated cleanly by `change_to=index`.
+- If `"amount": "all"` is passed, the command immediately halts with:
+  ```text
+  ValueError: Destination amount cannot be 'all'. In exactmultifundchannel, specify the base numerical amount for each channel, and use 'change_to=<index>' to designate which channel absorbs all leftover change.
+  ```
+
 ---
 
 ## Command Reference & Manual
@@ -213,7 +224,7 @@ exactmultifundchannel destinations [feerate] [minconf] [utxos] [minchannels] [co
 ### Parameters
 - `destinations` *(array, required)*: Array of destination objects (or JSON strings):
   - `id` *(string, required)*: Peer node pubkey (optional `@host:port`).
-  - `amount` *(integer/string, required)*: Base funding amount in satoshis, `'sat'`, `'msat'`, or `'btc'`.
+  - `amount` *(integer/string, required)*: Base funding amount in satoshis, `'sat'`, `'msat'`, or `'btc'`. **Note: `"amount": "all"` is NOT allowed** (use numerical base amounts; leftover change is assigned via `change_to`).
   - `max_amount` *(integer/string, optional)*: Upper limit cap for this channel.
   - `announce`, `push_msat`, `close_to`, `mindepth`, `reserve` *(optional)*.
 - `change_to` *(integer, required)*: Zero-based index in `destinations` of the channel that receives all leftover change. **Mandatory with no default**.
