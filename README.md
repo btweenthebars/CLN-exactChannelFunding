@@ -9,6 +9,8 @@ All leftover change satoshis are mathematically calculated and absorbed into a d
 ## Table of Contents
 1. [The Problem with Default Multifunding](#the-problem-with-default-multifunding)
 2. [The Solution: Zero-Change Funding](#the-solution-zero-change-funding)
+   - [Why Not Native multifundchannel with "amount": "all"?](#why-not-native-multifundchannel-with-amount-all)
+   - [Feature Comparison Table](#feature-comparison-table)
 3. [The Exact Calculation (Mathematical Breakdown)](#the-exact-calculation-mathematical-breakdown)
 4. [How UTXOs Are Selected & Figured Out](#how-utxos-are-selected--figured-out)
    - [Mode A: Manual UTXOs Specified](#mode-a-manual-utxos-specified)
@@ -48,6 +50,45 @@ When opening multiple channels with CLN's standard `multifundchannel`:
 $$\sum \text{Inputs} - \sum \text{Outputs} = \text{Fee}$$
 $$\text{Change Output Count} = 0$$
 $$\text{Change Amount} = 0 \text{ satoshis}$$
+
+### Why Not Native `multifundchannel` with `"amount": "all"`?
+
+Core Lightning's native `multifundchannel` does support setting `"amount": "all"` on a single destination. However, relying on native `"amount": "all"` has major risks and limitations:
+
+#### 1. In Automatic Mode (No `utxos` specified): The Whole-Wallet Sweep Trap
+If you omit `utxos`, native `multifundchannel` asks CLN's wallet for `"satoshi": "all"`. In Core Lightning ([`wallet/reservation.c:L572`](lightning/wallet/reservation.c)), this instructs the coin selector to **sweep every single available confirmed UTXO in your entire wallet** into that one channel. If your node has 10 UTXOs totaling 4 BTC, it will sweep all 4 BTC into that channel!
+- **Our Plugin**: Queries CLN's coin selector for **only the base channel amounts** (e.g. 1M + 2M = 3M sats). It selects only enough coins to cover the batch, leaving the rest of your wallet untouched, and absorbs just the leftover change from those specific coins into `change_to`.
+
+#### 2. In Manual Mode (`utxos` specified): 5 Critical Advantages Over Native
+Even if you manually pass `utxos=[...]` (where native `multifundchannel` can produce 0 change), `exactmultifundchannel` provides 5 crucial benefits that native CLN lacks:
+
+1. **Protection Against Silent Non-Wumbo Trimming**:
+   If the UTXOs you specify total $> 16,777,215\text{ sats}$ ($0.168\text{ BTC}$) and the `"all"` destination does not support Wumbo (large channels), native CLN ([`multifundchannel.c:L1291`](lightning/plugins/spender/multifundchannel.c)) **silently trims the channel to 16.77M sats, removes `"all"`, and creates a change output anyway**! Your zero-change goal is silently defeated.
+   - **Our Plugin**: Checks the peer's BOLT #9 feature bits 18/19 before broadcast and **halts with a clear error**, allowing you to choose a Wumbo-enabled peer or adjust inputs.
+2. **Channel Capacity Caps (`max_amount`)**:
+   Native CLN has no way to cap an `"all"` channel. If you pass a 5M sat UTXO for a 2M sat base channel, native CLN dumps the entire $\sim 4\text{M sat}$ remainder into that channel.
+   - **Our Plugin**: Supports `"max_amount"`. If change pushes the channel above your liquidity ceiling, it halts before broadcasting.
+3. **Dry-Run / Preview Mode (`calculate_exact_funding`)**:
+   Native CLN provides no way to preview the resulting transaction without broadcasting.
+   - **Our Plugin**: Allows full inspection of transaction weight, exact miner fee, and satoshi allocations down to the single satoshi before signing.
+4. **Pre-flight Dust Protection**:
+   If inputs are slightly too low, native CLN can fail halfway through protocol handshakes.
+   - **Our Plugin**: Verifies that the remaining satoshis satisfy the Bitcoin dust threshold ($546\text{ sats}$) mathematically before initiating handshakes.
+5. **Clean API Ergonomics**:
+   Native CLN forces you to mutate your destination JSON object, replacing an integer amount with the string `"all"`.
+   - **Our Plugin**: Keeps all channel amounts as clean integers and uses a simple, separate `change_to=index` parameter.
+
+### Feature Comparison Table
+
+| Feature | Native `multifundchannel` (default) | Native `multifundchannel` (`"all"`) | `exactmultifundchannel` (This Plugin) |
+| :--- | :---: | :---: | :---: |
+| **Zero Change Output** | ❌ (Creates change) | ✅ (Only with `utxos`) | ✅ **Always 0 change** |
+| **Auto Coin Selection (No `utxos`)** | ✅ | ❌ **Sweeps entire wallet** | ✅ **Targeted coin selection** |
+| **Non-Wumbo Safety** | N/A | ❌ Silently creates change output | ✅ **Aborts with clear error** |
+| **Channel Caps (`max_amount`)** | ❌ | ❌ | ✅ **Supported** |
+| **Dry-Run Preview** | ❌ | ❌ | ✅ **`calculate_exact_funding`** |
+| **Pre-flight Dust Validation** | ❌ | ❌ | ✅ **Validated before handshake** |
+| **API Parameter** | N/A | Mutates `"amount": "all"` | Clean `change_to=index` |
 
 ---
 
