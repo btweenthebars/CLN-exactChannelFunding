@@ -4,8 +4,11 @@ CLN Plugin: exactmultifundchannel
 Author: btweenthebars
 
 Opens multiple Core Lightning channels simultaneously with zero change left back
-to the user wallet, eliminating change outputs, saving transaction bytes,
-and preventing dust UTXO creation.
+to the user wallet. Any leftover change is absorbed into a designated destination
+channel specified by `change_go_to` (index in destinations array).
+
+Arguments match multifundchannel + change_go_to. Any extra/future arguments
+are passed straight through to multifundchannel without hardcoding.
 """
 
 import os
@@ -15,8 +18,7 @@ import socket
 
 RPC_PATH = None
 DUST_LIMIT_SAT = 546
-MAX_NON_WUMBO_SAT = 16777215  # 2^24 - 1 satoshis (0.16777215 BTC)
-P2WSH_OUTPUT_WEIGHT = 172      # (8 + 1 + 34) * 4 WU
+P2WSH_OUTPUT_WEIGHT = 172  # (8 + 1 + 34) * 4 WU
 
 
 def rpc_call(method, params=None):
@@ -31,7 +33,7 @@ def rpc_call(method, params=None):
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
-            "params": params or {}
+            "params": params if params is not None else {}
         }
         s.sendall(json.dumps(req).encode("utf-8"))
 
@@ -53,6 +55,20 @@ def rpc_call(method, params=None):
     finally:
         s.close()
     raise RuntimeError(f"Failed to read complete JSON response from RPC method {method}.")
+
+
+def parse_sat_amount(amt):
+    """Parses satoshi amount from integer or string (e.g. 1000, '1000sat', '1000000msat', '0.01btc')."""
+    if isinstance(amt, int):
+        return amt
+    s = str(amt).strip().lower()
+    if s.endswith("msat"):
+        return int(s[:-4]) // 1000
+    elif s.endswith("sat"):
+        return int(s[:-3])
+    elif s.endswith("btc"):
+        return int(float(s[:-3]) * 100_000_000)
+    return int(s)
 
 
 def varint_size(val):
@@ -89,14 +105,13 @@ def get_utxo_spend_weight(address_or_type):
         return 271
     elif addr.startswith("3") or addr.startswith("2") or "p2sh" in addr:
         return 363
-    # Fallback to standard P2WPKH weight
     return 271
 
 
-def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, excess_node_id, check_wumbo=True, node_features=None):
+def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_go_to_idx):
     """
-    Calculates exact non-change funding amounts down to the single satoshi.
-    Returns transaction weight, fee, and exact satoshi allocation for excess_node_id.
+    Calculates exact zero-change funding allocation down to the single satoshi.
+    Absorbs all remaining input funds into destinations[change_go_to_idx].
     """
     num_inputs = len(utxos_info)
     num_outputs = len(destinations)
@@ -105,79 +120,127 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, excess_
         raise ValueError("Cannot calculate allocation with 0 inputs.")
     if num_outputs == 0:
         raise ValueError("Cannot calculate allocation with 0 destinations.")
+    if change_go_to_idx < 0 or change_go_to_idx >= num_outputs:
+        raise ValueError(
+            f"'change_go_to' index {change_go_to_idx} is out of bounds for destinations list of length {num_outputs}."
+        )
 
-    # 1. Calculate transaction weight without any change output
+    # 1. Total transaction weight without change output
     core_weight = bitcoin_tx_core_weight(num_inputs, num_outputs)
     inputs_weight = sum(get_utxo_spend_weight(u.get("address", "")) for u in utxos_info)
     outputs_weight = num_outputs * P2WSH_OUTPUT_WEIGHT
 
     total_weight = core_weight + inputs_weight + outputs_weight
 
-    # 2. Exact fee using CLN's integer division: (feerate_per_kw * weight) // 1000
+    # 2. Exact fee using CLN integer division: (feerate_per_kw * weight) // 1000
     exact_fee = (feerate_per_kw * total_weight) // 1000
 
     # 3. Sum total inputs
     total_inputs = sum(u["amount_sat"] for u in utxos_info)
 
-    # 4. Sum fixed channel amounts for all other destinations
-    fixed_sum = 0
-    excess_node_found = False
-    for d in destinations:
-        if d["id"] == excess_node_id:
-            excess_node_found = True
-        else:
-            fixed_sum += d["amount"]
+    # 4. Sum amounts of all other destinations
+    other_dest_sum = sum(
+        parse_sat_amount(d["amount"])
+        for idx, d in enumerate(destinations)
+        if idx != change_go_to_idx
+    )
 
-    if not excess_node_found:
-        raise ValueError(f"Excess destination node '{excess_node_id}' not found in destinations list.")
+    # 5. Exact amount for destinations[change_go_to_idx]
+    target_orig_amount = parse_sat_amount(destinations[change_go_to_idx]["amount"])
+    exact_target_amount = total_inputs - other_dest_sum - exact_fee
 
-    # 5. Exact remainder goes to excess_node_id
-    exact_excess_amount = total_inputs - fixed_sum - exact_fee
-
-    if exact_excess_amount < DUST_LIMIT_SAT:
+    if exact_target_amount < DUST_LIMIT_SAT:
         raise ValueError(
-            f"Resulting channel amount for '{excess_node_id}' is {exact_excess_amount} sats, "
-            f"which is below the dust limit ({DUST_LIMIT_SAT} sats). "
-            f"Increase input amount or reduce other channel amounts."
+            f"Resulting channel amount for destination {change_go_to_idx} ({destinations[change_go_to_idx].get('id', '')}) "
+            f"is {exact_target_amount} sats, which is below the dust limit ({DUST_LIMIT_SAT} sats). "
+            f"Provide more input funds or reduce channel amounts."
         )
 
-    # 6. Wumbo / large channel checks
-    if check_wumbo and exact_excess_amount > MAX_NON_WUMBO_SAT:
-        # Check if node supports option_support_large_channel (bit 19)
-        has_wumbo = False
-        if node_features:
-            # Check bit 19 or hex features
-            has_wumbo = bool(node_features.get("large_channels", False))
-        if not has_wumbo:
-            # Warning or error if large channels not confirmed
-            pass  # CLN's multifundchannel also validates features during connect/start
+    change_absorbed = exact_target_amount - target_orig_amount
 
-    # Sanity verification: total_inputs - total_outputs == exact_fee (Zero change!)
-    total_outputs = fixed_sum + exact_excess_amount
-    assert total_inputs - total_outputs == exact_fee, "Accounting error: Inputs - Outputs != Fee!"
+    # Sanity check: total inputs == total outputs + fee (strictly 0 change)
+    total_outputs = other_dest_sum + exact_target_amount
+    assert total_inputs - total_outputs == exact_fee, "Accounting invariant failed: Inputs - Outputs != Fee!"
 
     return {
-        "exact_excess_amount": exact_excess_amount,
+        "exact_target_amount": exact_target_amount,
+        "target_orig_amount": target_orig_amount,
+        "change_absorbed": change_absorbed,
         "exact_fee": exact_fee,
         "total_weight": total_weight,
         "total_inputs": total_inputs,
-        "fixed_sum": fixed_sum,
-        "inputs_weight": inputs_weight,
-        "outputs_weight": outputs_weight,
-        "core_weight": core_weight
+        "other_dest_sum": other_dest_sum,
+        "change_go_to_idx": change_go_to_idx,
+        "change_go_to_id": destinations[change_go_to_idx].get("id", "")
     }
 
 
-def parse_feerate_arg(feerate_arg):
-    """Resolves feerate string or int into perkw via CLN parsefeerate."""
-    res = rpc_call("parsefeerate", {"feerate": feerate_arg})
-    return res["perkw"]
-
-
-def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf):
+def get_mfc_parameter_names():
     """
-    Gathers UTXOs either from user explicit parameter or runs CLN fundpsbt with reserve=0
-    to perform automatic minimal coin selection without wallet-drain.
+    Dynamically fetches the positional parameter names of multifundchannel
+    from CLN help command so that we don't hardcode them.
+    """
+    default_args = ["destinations", "feerate", "minconf", "utxos", "minchannels", "commitment_feerate"]
+    try:
+        help_res = rpc_call("help", {"command": "multifundchannel"})
+        cmd_info = help_res.get("help", [{}])[0]
+        cmd_str = cmd_info.get("command", "")
+        parts = cmd_str.split()
+        if parts and parts[0] == "multifundchannel":
+            args = [p.strip("[]") for p in parts[1:] if p.strip("[]")]
+            if args:
+                return args
+    except Exception:
+        pass
+    return default_args
+
+
+def normalize_params(params):
+    """
+    Normalizes incoming params whether passed as a list (positional) or dict (keyword -k),
+    converting to a dict without dropping any unknown or future arguments.
+    """
+    if isinstance(params, list):
+        arg_names = get_mfc_parameter_names() + ["change_go_to"]
+        dict_params = {}
+        for i, val in enumerate(params):
+            if i < len(arg_names):
+                dict_params[arg_names[i]] = val
+            else:
+                dict_params[f"arg_{i}"] = val
+        return dict_params
+    elif isinstance(params, dict):
+        return dict(params)
+    else:
+        raise ValueError("Invalid params type: expected list or dict.")
+
+
+def parse_destinations(destinations_raw):
+    """
+    Parses destinations array, handling lists of dicts or lists of JSON strings
+    (such as destinations=['{"id": "...", "amount": ...}', ...]).
+    """
+    if isinstance(destinations_raw, str):
+        destinations_raw = json.loads(destinations_raw)
+
+    if not isinstance(destinations_raw, list) or len(destinations_raw) == 0:
+        raise ValueError("'destinations' must be a non-empty array.")
+
+    parsed = []
+    for item in destinations_raw:
+        if isinstance(item, str):
+            parsed.append(json.loads(item))
+        elif isinstance(item, dict):
+            parsed.append(dict(item))
+        else:
+            raise ValueError(f"Invalid destination entry: {item!r}")
+    return parsed
+
+
+def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf=1):
+    """
+    Collects confirmed UTXOs from wallet matching specified_utxos, or performs
+    automatic coin selection via fundpsbt(reserve=0) for the base channel amounts.
     """
     funds = rpc_call("listfunds")["outputs"]
     wallet_utxos = {f"{u['txid']}:{u['output']}": u for u in funds if u.get("status") == "confirmed"}
@@ -185,6 +248,9 @@ def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf):
     selected_utxos_info = []
 
     if specified_utxos:
+        if isinstance(specified_utxos, str):
+            specified_utxos = json.loads(specified_utxos)
+
         for outpoint in specified_utxos:
             if outpoint not in wallet_utxos:
                 raise ValueError(f"Specified UTXO '{outpoint}' was not found as a confirmed UTXO in wallet.")
@@ -196,7 +262,7 @@ def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf):
             })
     else:
         # Automatic coin selection: run fundpsbt with reserve=0 for base amounts
-        total_base = sum(d["amount"] for d in destinations)
+        total_base = sum(parse_sat_amount(d["amount"]) for d in destinations)
         startweight = bitcoin_tx_core_weight(1, len(destinations)) + len(destinations) * P2WSH_OUTPUT_WEIGHT
         fund_res = rpc_call("fundpsbt", {
             "satoshi": total_base,
@@ -208,10 +274,6 @@ def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf):
         })
 
         reservations = fund_res.get("reservations", [])
-        if not reservations and "psbt" in fund_res:
-            # Fallback if reservations array not present: query unreserve
-            pass
-
         for res in reservations:
             outpoint = f"{res['txid']}:{res['vout']}"
             u = wallet_utxos.get(outpoint, {})
@@ -228,39 +290,66 @@ def collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf):
     return selected_utxos_info
 
 
-def process_exact_funding(params, dry_run=False):
-    """Core logic to calculate exact zero-change funding and optionally execute multifundchannel."""
-    destinations = params.get("destinations")
-    if not destinations or not isinstance(destinations, list) or len(destinations) < 1:
-        raise ValueError("'destinations' must be a non-empty array of objects with 'id' and 'amount'.")
+def process_exact_funding(raw_params, dry_run=False):
+    """
+    Processes exact zero-change funding:
+    1. Normalizes parameters dynamically.
+    2. Parses destinations and change_go_to index.
+    3. Resolves feerate and UTXOs.
+    4. Calculates exact non-change satoshi amount for destinations[change_go_to].
+    5. Updates destinations and calls multifundchannel with ALL other arguments preserved.
+    """
+    params = normalize_params(raw_params)
 
-    excess_node_id = params.get("excess_node", destinations[0]["id"])
+    if "destinations" not in params:
+        raise ValueError("Missing required parameter 'destinations'.")
+
+    destinations = parse_destinations(params["destinations"])
+
+    # 1. Parse change_go_to index (defaults to 0)
+    change_go_to_raw = params.get("change_go_to", 0)
+    try:
+        change_go_to_idx = int(change_go_to_raw)
+    except (ValueError, TypeError):
+        raise ValueError(f"'change_go_to' must be an integer index, got {change_go_to_raw!r}")
+
+    if change_go_to_idx < 0 or change_go_to_idx >= len(destinations):
+        raise ValueError(
+            f"'change_go_to' index {change_go_to_idx} is out of bounds for destinations array of length {len(destinations)} "
+            f"(valid indices: 0 to {len(destinations) - 1})."
+        )
+
+    # 2. Resolve feerate to perkw via CLN
     feerate_arg = params.get("feerate", "opening")
+    feerate_res = rpc_call("parsefeerate", {"feerate": feerate_arg})
+    feerate_per_kw = feerate_res["perkw"]
+
+    # 3. Collect UTXOs (explicit or automatic)
     minconf = params.get("minconf", 1)
     specified_utxos = params.get("utxos")
-
-    # 1. Resolve feerate
-    feerate_per_kw = parse_feerate_arg(feerate_arg)
-
-    # 2. Select/Collect UTXOs
     selected_utxos = collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf)
 
-    # 3. Calculate exact zero-change allocation
-    calc = calculate_exact_allocation(destinations, feerate_per_kw, selected_utxos, excess_node_id)
+    # 4. Calculate exact zero-change allocation
+    calc = calculate_exact_allocation(destinations, feerate_per_kw, selected_utxos, change_go_to_idx)
 
-    # 4. Prepare updated destinations array
+    # 5. Update destinations: add the change into destinations[change_go_to_idx]
     final_destinations = []
-    for d in destinations:
+    for idx, d in enumerate(destinations):
         new_d = dict(d)
-        if d["id"] == excess_node_id:
-            new_d["amount"] = calc["exact_excess_amount"]
+        if idx == change_go_to_idx:
+            new_d["amount"] = calc["exact_target_amount"]
+        else:
+            new_d["amount"] = parse_sat_amount(d["amount"])
         final_destinations.append(new_d)
 
     utxo_outpoints = [u["outpoint"] for u in selected_utxos]
 
     summary = {
-        "excess_node_id": excess_node_id,
-        "exact_channel_amount": calc["exact_excess_amount"],
+        "change_go_to_index": change_go_to_idx,
+        "change_go_to_node_id": calc["change_go_to_id"],
+        "original_amount_sat": calc["target_orig_amount"],
+        "change_absorbed_sat": calc["change_absorbed"],
+        "final_channel_amount_sat": calc["exact_target_amount"],
         "exact_fee_sat": calc["exact_fee"],
         "total_inputs_sat": calc["total_inputs"],
         "tx_weight": calc["total_weight"],
@@ -270,23 +359,22 @@ def process_exact_funding(params, dry_run=False):
         "utxos_spent": utxo_outpoints
     }
 
+    # 6. Prepare multifundchannel arguments:
+    # Retain ALL original arguments without hardcoding, remove change_go_to, update destinations & utxos
+    mfc_params = dict(params)
+    mfc_params.pop("change_go_to", None)
+    mfc_params["destinations"] = final_destinations
+    if not mfc_params.get("utxos"):
+        mfc_params["utxos"] = utxo_outpoints
+
     if dry_run:
         return {
             "dry_run": True,
             "summary": summary,
-            "final_destinations": final_destinations
+            "multifundchannel_params": mfc_params
         }
 
-    # 5. Call multifundchannel
-    mfc_params = {
-        "destinations": final_destinations,
-        "feerate": f"{feerate_per_kw}perkw",
-        "utxos": utxo_outpoints
-    }
-    for opt in ["minconf", "commitment_feerate", "minchannels"]:
-        if opt in params:
-            mfc_params[opt] = params[opt]
-
+    # 7. Execute multifundchannel
     mfc_res = rpc_call("multifundchannel", mfc_params)
     mfc_res["zero_change_summary"] = summary
     return mfc_res
@@ -313,12 +401,12 @@ def main():
                     "rpcmethods": [
                         {
                             "name": "exactmultifundchannel",
-                            "usage": "destinations [excess_node] [feerate] [minconf] [utxos] [commitment_feerate]",
-                            "description": "Opens multiple payment channels using multifundchannel with zero change back to the wallet. Any change is absorbed into excess_node."
+                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] [change_go_to]",
+                            "description": "Opens channels with multifundchannel adding all leftover change into destination[change_go_to] with zero change outputs."
                         },
                         {
                             "name": "calculate_exact_funding",
-                            "usage": "destinations [excess_node] [feerate] [minconf] [utxos]",
+                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] [change_go_to]",
                             "description": "Dry-run calculation of exact zero-change channel funding amounts and transaction fee."
                         }
                     ]
