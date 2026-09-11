@@ -6,12 +6,12 @@ A lightweight, zero-dependency Core Lightning (CLN) plugin that opens multiple L
 
 ## Overview & Interface
 
-`exactmultifundchannel` mirrors the exact interface of CLN's `multifundchannel`, adding a `change_go_to` argument to specify which destination channel absorbs all leftover change satoshis.
+`exactmultifundchannel` mirrors the exact interface of CLN's `multifundchannel`, adding a **mandatory** `change_to` argument to specify which destination channel absorbs all leftover change satoshis.
 
 Any existing, optional, or future arguments supported by `multifundchannel` are automatically forwarded without hardcoding.
 
 ```bash
-exactmultifundchannel destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] ... [change_go_to=index]
+exactmultifundchannel destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] ... change_to=index
 ```
 
 ### Example
@@ -21,14 +21,14 @@ lightning-cli -k exactmultifundchannel \
   feerate=700 \
   destinations='[{"id":"aaaaa", "amount":1000000},{"id":"bbbb", "amount":2000000}]' \
   utxos='["xxxx:0","yyyy:1"]' \
-  change_go_to=1
+  change_to=1
 ```
 
 In this example:
-- `change_go_to=1` selects the channel at index `1` (node `"bbbb"`).
+- `change_to=1` (mandatory) selects the channel at index `1` (node `"bbbb"`).
 - Node `"aaaaa"` receives its exact requested `1,000,000` sats.
 - The exact non-change fee is calculated for the transaction.
-- All remaining satoshis from the inputs are added to node `"bbbb"`:
+- All remaining satoshis from the inputs are added into node `"bbbb"`:
   $$\text{Amount}(\text{"bbbb"}) = 2,000,000 + \text{Change}$$
 - `multifundchannel` is called with the adjusted destinations and all other arguments passed through.
 - **Change outputs on the funding transaction: 0.**
@@ -47,7 +47,7 @@ When opening multiple Lightning channels normally:
 `exactmultifundchannel` fixes this:
 - If `utxos` is provided, it uses only those UTXOs.
 - If `utxos` is omitted, it performs minimal coin selection using `fundpsbt(reserve=0)` for just the base amounts, avoiding whole-wallet sweeps.
-- It then calculates the exact fee with **zero change outputs**, allocating all remainder directly into `destinations[change_go_to]`.
+- It calculates the exact fee with **zero change outputs**, allocating all remainder directly into `destinations[change_to]`.
 
 $$\sum \text{Inputs} - \sum \text{Outputs} = \text{Fee}_{\text{exact}}$$
 $$\text{Change} = 0 \text{ satoshis}$$
@@ -80,7 +80,7 @@ Executes `multifundchannel` with zero change outputs.
 
 #### Parameters:
 - `destinations` *(array, required)*: List of destination objects (or JSON strings).
-- `change_go_to` *(integer, optional)*: Zero-based index in `destinations` to absorb the change. Defaults to `0`.
+- `change_to` *(integer, required)*: Zero-based index in `destinations` of the channel to absorb all change satoshis. **Mandatory with no default**.
 - `feerate` *(string/number, optional)*: Fee rate (e.g. `"normal"`, `"urgent"`, `700`, `"2500perkw"`). Defaults to `"opening"`.
 - `utxos` *(array of strings, optional)*: Specific `txid:vout` outpoints to spend.
 - `minconf`, `minchannels`, `commitment_feerate`, etc.: Any standard or future `multifundchannel` argument.
@@ -95,7 +95,7 @@ lightning-cli -k calculate_exact_funding \
   feerate=700 \
   destinations='[{"id":"aaaaa", "amount":1000000},{"id":"bbbb", "amount":2000000}]' \
   utxos='["xxxx:0","yyyy:1"]' \
-  change_go_to=1
+  change_to=1
 ```
 
 #### Output:
@@ -103,8 +103,8 @@ lightning-cli -k calculate_exact_funding \
 {
   "dry_run": true,
   "summary": {
-    "change_go_to_index": 1,
-    "change_go_to_node_id": "bbbb",
+    "change_to_index": 1,
+    "change_to_node_id": "bbbb",
     "original_amount_sat": 2000000,
     "change_absorbed_sat": 999351,
     "final_channel_amount_sat": 2999351,

@@ -5,9 +5,9 @@ Author: btweenthebars
 
 Opens multiple Core Lightning channels simultaneously with zero change left back
 to the user wallet. Any leftover change is absorbed into a designated destination
-channel specified by `change_go_to` (index in destinations array).
+channel specified by `change_to` (index in destinations array).
 
-Arguments match multifundchannel + change_go_to. Any extra/future arguments
+Arguments match multifundchannel + change_to (mandatory). Any extra/future arguments
 are passed straight through to multifundchannel without hardcoding.
 """
 
@@ -108,10 +108,10 @@ def get_utxo_spend_weight(address_or_type):
     return 271
 
 
-def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_go_to_idx):
+def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_to_idx):
     """
     Calculates exact zero-change funding allocation down to the single satoshi.
-    Absorbs all remaining input funds into destinations[change_go_to_idx].
+    Absorbs all remaining input funds into destinations[change_to_idx].
     """
     num_inputs = len(utxos_info)
     num_outputs = len(destinations)
@@ -120,9 +120,9 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
         raise ValueError("Cannot calculate allocation with 0 inputs.")
     if num_outputs == 0:
         raise ValueError("Cannot calculate allocation with 0 destinations.")
-    if change_go_to_idx < 0 or change_go_to_idx >= num_outputs:
+    if change_to_idx < 0 or change_to_idx >= num_outputs:
         raise ValueError(
-            f"'change_go_to' index {change_go_to_idx} is out of bounds for destinations list of length {num_outputs}."
+            f"'change_to' index {change_to_idx} is out of bounds for destinations list of length {num_outputs}."
         )
 
     # 1. Total transaction weight without change output
@@ -142,16 +142,16 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
     other_dest_sum = sum(
         parse_sat_amount(d["amount"])
         for idx, d in enumerate(destinations)
-        if idx != change_go_to_idx
+        if idx != change_to_idx
     )
 
-    # 5. Exact amount for destinations[change_go_to_idx]
-    target_orig_amount = parse_sat_amount(destinations[change_go_to_idx]["amount"])
+    # 5. Exact amount for destinations[change_to_idx]
+    target_orig_amount = parse_sat_amount(destinations[change_to_idx]["amount"])
     exact_target_amount = total_inputs - other_dest_sum - exact_fee
 
     if exact_target_amount < DUST_LIMIT_SAT:
         raise ValueError(
-            f"Resulting channel amount for destination {change_go_to_idx} ({destinations[change_go_to_idx].get('id', '')}) "
+            f"Resulting channel amount for destination {change_to_idx} ({destinations[change_to_idx].get('id', '')}) "
             f"is {exact_target_amount} sats, which is below the dust limit ({DUST_LIMIT_SAT} sats). "
             f"Provide more input funds or reduce channel amounts."
         )
@@ -170,8 +170,8 @@ def calculate_exact_allocation(destinations, feerate_per_kw, utxos_info, change_
         "total_weight": total_weight,
         "total_inputs": total_inputs,
         "other_dest_sum": other_dest_sum,
-        "change_go_to_idx": change_go_to_idx,
-        "change_go_to_id": destinations[change_go_to_idx].get("id", "")
+        "change_to_idx": change_to_idx,
+        "change_to_id": destinations[change_to_idx].get("id", "")
     }
 
 
@@ -201,7 +201,7 @@ def normalize_params(params):
     converting to a dict without dropping any unknown or future arguments.
     """
     if isinstance(params, list):
-        arg_names = get_mfc_parameter_names() + ["change_go_to"]
+        arg_names = get_mfc_parameter_names() + ["change_to"]
         dict_params = {}
         for i, val in enumerate(params):
             if i < len(arg_names):
@@ -294,9 +294,9 @@ def process_exact_funding(raw_params, dry_run=False):
     """
     Processes exact zero-change funding:
     1. Normalizes parameters dynamically.
-    2. Parses destinations and change_go_to index.
+    2. Parses destinations and change_to index (mandatory).
     3. Resolves feerate and UTXOs.
-    4. Calculates exact non-change satoshi amount for destinations[change_go_to].
+    4. Calculates exact non-change satoshi amount for destinations[change_to].
     5. Updates destinations and calls multifundchannel with ALL other arguments preserved.
     """
     params = normalize_params(raw_params)
@@ -306,16 +306,21 @@ def process_exact_funding(raw_params, dry_run=False):
 
     destinations = parse_destinations(params["destinations"])
 
-    # 1. Parse change_go_to index (defaults to 0)
-    change_go_to_raw = params.get("change_go_to", 0)
-    try:
-        change_go_to_idx = int(change_go_to_raw)
-    except (ValueError, TypeError):
-        raise ValueError(f"'change_go_to' must be an integer index, got {change_go_to_raw!r}")
-
-    if change_go_to_idx < 0 or change_go_to_idx >= len(destinations):
+    # 1. Parse change_to index (mandatory, no default)
+    if "change_to" not in params or params["change_to"] is None:
         raise ValueError(
-            f"'change_go_to' index {change_go_to_idx} is out of bounds for destinations array of length {len(destinations)} "
+            "Missing required parameter 'change_to' (integer index of destination channel in 'destinations' to receive change)."
+        )
+
+    change_to_raw = params["change_to"]
+    try:
+        change_to_idx = int(change_to_raw)
+    except (ValueError, TypeError):
+        raise ValueError(f"'change_to' must be an integer index, got {change_to_raw!r}")
+
+    if change_to_idx < 0 or change_to_idx >= len(destinations):
+        raise ValueError(
+            f"'change_to' index {change_to_idx} is out of bounds for destinations array of length {len(destinations)} "
             f"(valid indices: 0 to {len(destinations) - 1})."
         )
 
@@ -330,13 +335,13 @@ def process_exact_funding(raw_params, dry_run=False):
     selected_utxos = collect_utxos(specified_utxos, destinations, feerate_per_kw, minconf)
 
     # 4. Calculate exact zero-change allocation
-    calc = calculate_exact_allocation(destinations, feerate_per_kw, selected_utxos, change_go_to_idx)
+    calc = calculate_exact_allocation(destinations, feerate_per_kw, selected_utxos, change_to_idx)
 
-    # 5. Update destinations: add the change into destinations[change_go_to_idx]
+    # 5. Update destinations: add the change into destinations[change_to_idx]
     final_destinations = []
     for idx, d in enumerate(destinations):
         new_d = dict(d)
-        if idx == change_go_to_idx:
+        if idx == change_to_idx:
             new_d["amount"] = calc["exact_target_amount"]
         else:
             new_d["amount"] = parse_sat_amount(d["amount"])
@@ -345,8 +350,8 @@ def process_exact_funding(raw_params, dry_run=False):
     utxo_outpoints = [u["outpoint"] for u in selected_utxos]
 
     summary = {
-        "change_go_to_index": change_go_to_idx,
-        "change_go_to_node_id": calc["change_go_to_id"],
+        "change_to_index": change_to_idx,
+        "change_to_node_id": calc["change_to_id"],
         "original_amount_sat": calc["target_orig_amount"],
         "change_absorbed_sat": calc["change_absorbed"],
         "final_channel_amount_sat": calc["exact_target_amount"],
@@ -360,9 +365,9 @@ def process_exact_funding(raw_params, dry_run=False):
     }
 
     # 6. Prepare multifundchannel arguments:
-    # Retain ALL original arguments without hardcoding, remove change_go_to, update destinations & utxos
+    # Retain ALL original arguments without hardcoding, remove change_to, update destinations & utxos
     mfc_params = dict(params)
-    mfc_params.pop("change_go_to", None)
+    mfc_params.pop("change_to", None)
     mfc_params["destinations"] = final_destinations
     if not mfc_params.get("utxos"):
         mfc_params["utxos"] = utxo_outpoints
@@ -401,12 +406,12 @@ def main():
                     "rpcmethods": [
                         {
                             "name": "exactmultifundchannel",
-                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] [change_go_to]",
-                            "description": "Opens channels with multifundchannel adding all leftover change into destination[change_go_to] with zero change outputs."
+                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] change_to",
+                            "description": "Opens channels with multifundchannel adding all leftover change into destination[change_to] with zero change outputs."
                         },
                         {
                             "name": "calculate_exact_funding",
-                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] [change_go_to]",
+                            "usage": "destinations [feerate] [minconf] [utxos] [minchannels] [commitment_feerate] change_to",
                             "description": "Dry-run calculation of exact zero-change channel funding amounts and transaction fee."
                         }
                     ]
